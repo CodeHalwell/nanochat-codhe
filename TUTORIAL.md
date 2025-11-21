@@ -234,13 +234,18 @@ The training pipeline consists of four main stages, each building on the previou
 ```python
 @dataclass
 class GPTConfig:
-    sequence_len: int = 1024    # context window
-    vocab_size: int = 50304     # vocabulary size
-    n_layer: int = 12           # number of transformer blocks
-    n_head: int = 6             # attention heads per layer
-    n_kv_head: int = 6          # key/value heads (GQA)
-    n_embd: int = 768           # embedding dimension
+    sequence_len: int = 1024    # context window (default)
+    vocab_size: int = 50304     # vocabulary size (default)
+    n_layer: int = 12           # number of transformer blocks (default)
+    n_head: int = 6             # attention heads per layer (default)
+    n_kv_head: int = 6          # key/value heads (GQA) (default)
+    n_embd: int = 768           # embedding dimension (default)
 ```
+
+**Note**: These are base defaults in GPTConfig. Actual training typically uses:
+- `sequence_len = 2048` (set via `max_seq_len` in training scripts)
+- `vocab_size = 65536` (determined by trained tokenizer, 2^16)
+- Other parameters derived from `depth` argument (e.g., depth=20 → n_layer=20)
 
 **Key Features**:
 
@@ -1843,9 +1848,10 @@ nanochat demonstrates that:
 
 ### Resources
 
-- **Repository**: https://github.com/karpathy/nanochat
-- **Discussions**: Check GitHub Discussions for guides and help
-- **DeepWiki**: https://deepwiki.com/karpathy/nanochat for AI-powered exploration
+- **Original Repository**: https://github.com/karpathy/nanochat
+- **This Fork**: https://github.com/CodeHalwell/nanochat-codhe
+- **Discussions**: Check GitHub Discussions in the original repo for guides and help
+- **DeepWiki**: https://deepwiki.com/karpathy/nanochat for AI-powered exploration (original repo)
 - **Wandb**: Use for experiment tracking
 - **Lambda**: Recommended GPU provider
 
