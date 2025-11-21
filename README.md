@@ -103,6 +103,20 @@ To customize your nanochat, see [Guide: infusing identity to your nanochat](http
 
 Additionally, to add new abilities to nanochat, see [Guide: counting r in strawberry (and how to add abilities generally)](https://github.com/karpathy/nanochat/discussions/164).
 
+## Tutorial
+
+For an in-depth understanding of how nanochat works, see [TUTORIAL.md](TUTORIAL.md). This comprehensive guide covers:
+
+- Complete training pipeline (tokenization → pretraining → midtraining → SFT → RL)
+- Model architecture deep dive (attention, transformers, optimizers)
+- Data loading and processing systems
+- Evaluation framework and benchmarks
+- Inference and serving (CLI, Web, API)
+- Customization patterns and scaling
+- How everything fits together
+
+The tutorial is designed to help you understand not just **what** nanochat does, but **why** and **how** it does it.
+
 ## Questions
 
 nanochat is designed to be short and sweet. One big advantage of this is that we can package up all of the files together and copy paste them to your favorite LLM to ask arbitrary questions. As an example, I like to package up the repo using the [files-to-prompt](https://github.com/simonw/files-to-prompt) utility like so:
