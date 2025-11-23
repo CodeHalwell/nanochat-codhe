@@ -24,6 +24,7 @@ def print0(s="",**kwargs):
         print(s, **kwargs)
 
 for arg in sys.argv[1:]:
+    if not arg.strip(): continue # skip empty/whitespace args
     if '=' not in arg:
         # assume it's the name of a config file
         assert not arg.startswith('--')

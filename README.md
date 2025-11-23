@@ -64,6 +64,46 @@ Total wall clock time: 3h51m
 
 (Your table might be missing the RL number by default). For a lot more information around the speedrun script and what to look for and expect, please refer to the walkthrough that I posted in Discussions of the repo: ["Introducing nanochat: The best ChatGPT that $100 can buy"](https://github.com/karpathy/nanochat/discussions/1).
 
+## Recursive Model & Bayesian Refinement
+
+Nanochat now supports **Recursive Models** (inspired by the "Less is More" paper) and **Bayesian Refinement Sampling**.
+
+### Training Flow
+
+```mermaid
+graph TD
+    A[Input Tokens] --> B(Embedding Layer)
+    B --> C{Recursive Block Loop}
+    
+    subgraph RecursiveBlock ["Recursive Block (Shared Weights)"]
+        direction TB
+        C -- "Loop 1..N" --> D[Layer Norm]
+        D --> E[Causal Self Attention]
+        E --> F[Residual Connection]
+        F --> G[Layer Norm]
+        G --> H[MLP]
+        H --> I[Residual Connection]
+        I -- "Next Loop / Output" --> C
+    end
+    
+    C -- "Loop 1..N-1" --> I
+    I -- "Intermediate Output" --> N[Intermediate Loss Calculation]
+    N --> M
+    
+    C -- "After N Loops" --> J[Final Layer Norm]
+    J --> K[Language Model Head]
+    K --> L[Logits]
+    L --> M((Cross Entropy Loss))
+    
+    style RecursiveBlock fill:#f9f,stroke:#333,stroke-width:2px
+    style N stroke-dasharray: 5 5
+```
+
+**Key Concepts:**
+1.  **Shared Weights**: The `RecursiveBlock` uses the *same* Attention and MLP layers for every loop iteration.
+2.  **Depth vs. Parameters**: A model with `depth=2` and `n_loops=3` effectively processes data through 6 layers, but only has the parameters of 2 layers.
+3.  **Bayesian Refinement**: During inference, use `--bayesian-refine` to perform a two-pass generation (Prior -> Refinement) to improve response quality.
+
 ## Bigger models
 
 Unsurprisingly, $100 is not enough to train a highly performant ChatGPT clone. In fact, LLMs are famous for their multi-million dollar capex. For our purposes, I think there are two more scales of interest. First is the ~$300 tier d26 model (i.e. depth=26) that trains in ~12 hours, which slightly outperforms GPT-2 CORE score. Second is the $1000 tier (~41.6 hours), just because it's a nice round number. But both of these are not yet fully supported and therefore not attached here in the master branch yet.

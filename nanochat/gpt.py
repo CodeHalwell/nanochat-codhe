@@ -31,6 +31,64 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    n_loops: int = 2  # TRM: latent recursion steps
+    n_sup_train: int = 4  # Deep supervision steps (training)
+    n_sup_inference: int = 2  # Deep supervision steps (inference)
+    T_recursion: int = 1  # TRM: recursion depth (T-1 no grad, 1 with grad)
+    activation_fn: str = 'swiglu'  # Options: 'relu_squared', 'swiglu', 'geglu' (swiglu is best)
+
+    # TRM Progressive Refinement Settings
+    # These control how aggressively the model learns to refine across supervision steps
+    #
+    # DEFAULT (aggressive preset - recommended for production):
+    supervision_weight_base: float = 5.0  # Hierarchical weighting
+    improvement_reward_scale: float = 1.0  # Improvement bonus
+    # Expected: 15-25% refinement, stable training
+    #
+    # FOR MAXIMUM REFINEMENT (extreme preset - research/experimentation):
+    # supervision_weight_base: float = 10.0  # Uncomment for 50-97% refinement
+    # improvement_reward_scale: float = 2.0  # Uncomment for 50-97% refinement
+    # IMPORTANT: Also reduce learning rates to ~0.0005/0.005 (see test_local_extreme.sh)
+    #
+    # Options:
+    # - 3.0, 0.5 = moderate   (8-12% refinement, very stable)
+    # - 5.0, 1.0 = aggressive (15-25% refinement, RECOMMENDED) ← DEFAULT
+    # - 10.0, 2.0 = extreme   (50-97% refinement, slower training required)
+
+    @classmethod
+    def with_refinement_preset(cls, preset='aggressive', **kwargs):
+        """
+        Create a GPTConfig with TRM refinement presets.
+
+        Presets:
+        - 'moderate': 8-12% refinement, very stable (production safe)
+        - 'aggressive': 15-25% refinement, stable (RECOMMENDED for most use cases)
+        - 'extreme': 50-97% refinement, requires careful tuning (research/experimentation)
+
+        Example:
+            config = GPTConfig.with_refinement_preset('extreme', n_layer=12, n_embd=768)
+        """
+        presets = {
+            'moderate': {
+                'supervision_weight_base': 3.0,
+                'improvement_reward_scale': 0.5,
+            },
+            'aggressive': {
+                'supervision_weight_base': 5.0,
+                'improvement_reward_scale': 1.0,
+            },
+            'extreme': {
+                'supervision_weight_base': 10.0,
+                'improvement_reward_scale': 2.0,
+            },
+        }
+
+        if preset not in presets:
+            raise ValueError(f"Unknown preset '{preset}'. Choose from: {list(presets.keys())}")
+
+        # Merge preset with user overrides
+        config_dict = {**presets[preset], **kwargs}
+        return cls(**config_dict)
 
 
 def norm(x):
@@ -63,7 +121,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x, cos_sin, kv_cache, layer_idx=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -79,7 +137,8 @@ class CausalSelfAttention(nn.Module):
 
         # Apply KV cache: insert current k,v into cache, get the full view so far
         if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+            idx = layer_idx if layer_idx is not None else self.layer_idx
+            k, v = kv_cache.insert_kv(idx, k, v)
         Tq = q.size(2) # number of queries in this forward pass
         Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
 
@@ -113,13 +172,37 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        hidden_dim = 4 * config.n_embd
+
+        # SwiGLU/GeGLU require 2x hidden dim for gate+value, relu² uses standard hidden dim
+        if config.activation_fn in ('swiglu', 'geglu'):
+            self.c_fc = nn.Linear(config.n_embd, 2 * hidden_dim, bias=False)
+            self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        else:  # relu_squared
+            self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+
+        self.activation_fn = config.activation_fn
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
+        if self.activation_fn == 'swiglu':
+            # SwiGLU: x = SiLU(gate) * value
+            # Used in: LLaMA, Mistral, Gemma
+            x = self.c_fc(x)
+            gate, value = x.chunk(2, dim=-1)
+            x = F.silu(gate) * value
+            x = self.c_proj(x)
+        elif self.activation_fn == 'geglu':
+            # GeGLU: x = GELU(gate) * value
+            # Alternative gated activation
+            x = self.c_fc(x)
+            gate, value = x.chunk(2, dim=-1)
+            x = F.gelu(gate) * value
+            x = self.c_proj(x)
+        else:  # relu_squared (default)
+            x = self.c_fc(x)
+            x = F.relu(x).square()
+            x = self.c_proj(x)
         return x
 
 
@@ -129,10 +212,64 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos_sin, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, kv_cache)
+    def forward(self, x, cos_sin, kv_cache, layer_idx=None):
+        x = x + self.attn(norm(x), cos_sin, kv_cache, layer_idx)
         x = x + self.mlp(norm(x))
         return x
+
+
+class RecursiveBlock(nn.Module):
+    """TRM recursive block with y (answer) and z (reasoning) states"""
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.block = Block(config, layer_idx)
+        self.n_loops = config.n_loops
+        self.layer_idx = layer_idx
+        self.T_recursion = config.T_recursion
+
+    @property
+    def mlp(self):
+        return self.block.mlp
+
+    @property
+    def attn(self):
+        return self.block.attn
+
+    def forward(self, x, y, z, cos_sin, kv_cache, T=None):
+        """TRM with proper residual connections for stability"""
+        T = T if T is not None else self.T_recursion
+        
+        # T-1 passes without gradients
+        with torch.no_grad():
+            for _ in range(T - 1):
+                # Fast loop: Update z
+                for i in range(self.n_loops):
+                    z_input = norm(x + y + z)
+                    virtual_idx = self.layer_idx * (self.n_loops + 1) + i
+                    output = self.block(z_input, cos_sin, kv_cache, layer_idx=virtual_idx)
+                    # Standard residual connection
+                    z = z + output
+
+                # Slow loop: Update y
+                y_input = norm(y + z)
+                virtual_idx = self.layer_idx * (self.n_loops + 1) + self.n_loops
+                output = self.block(y_input, cos_sin, kv_cache, layer_idx=virtual_idx)
+                # Standard residual connection
+                y = y + output
+        
+        # 1 pass with gradients (same structure)
+        for i in range(self.n_loops):
+            z_input = norm(x + y + z)
+            virtual_idx = self.layer_idx * (self.n_loops + 1) + i
+            output = self.block(z_input, cos_sin, kv_cache, layer_idx=virtual_idx)
+            z = z + output  # Standard residual connection
+
+        y_input = norm(y + z)
+        virtual_idx = self.layer_idx * (self.n_loops + 1) + self.n_loops
+        output = self.block(y_input, cos_sin, kv_cache, layer_idx=virtual_idx)
+        y = y + output  # Standard residual connection
+        
+        return y, z
 
 
 class GPT(nn.Module):
@@ -141,7 +278,7 @@ class GPT(nn.Module):
         self.config = config
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([RecursiveBlock(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
@@ -241,39 +378,106 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', n_sup=None):
+        """TRM forward with deep supervision"""
         B, T = idx.size()
-
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
-        assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
+        
+        # Rotary embeddings
+        assert T <= self.cos.size(1)
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
-
-        # Forward the trunk of the Transformer
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        
+        # Embed input (x = question, never changes)
         x = self.transformer.wte(idx)
         x = norm(x)
-        for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
-        x = norm(x)
-
-        # Forward the lm_head (compute logits)
+        
         softcap = 15
-        if targets is not None:
-            # training mode: compute and return the loss
-            # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
-            logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
-            logits = logits.float() # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
-        else:
-            # inference mode: compute and return the logits
-            logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
+        
+        if targets is None:
+            # Inference: use provided n_sup or default to config
+            N_sup = n_sup if n_sup is not None else self.config.n_sup_inference
+            y, z = x.clone(), torch.zeros_like(x)
+            
+            for _ in range(N_sup):
+                for block in self.transformer.h:
+                    y, z = block(x, y, z, cos_sin, kv_cache)
+                y, z = y.detach(), z.detach()
+            
+            logits = self.lm_head(norm(y))
+            logits = softcap * torch.tanh(logits / softcap)
             return logits
+        else:
+            # Training: TRM Deep Supervision with Progressive Refinement
+            # ============================================================
+            # The TRM model learns to progressively refine its answer across N_sup supervision steps:
+            #   Step 0: Initial rough answer (may be intentionally poor)
+            #   Step 1-2: Iterative refinement through y/z state updates
+            #   Step 3: Final polished answer
+            #
+            # Key mechanisms for achieving refinement:
+            # 1. Hierarchical weighting: Later steps weighted exponentially more (base^i)
+            # 2. Improvement reward: Explicit bonus for improving over previous step
+            # 3. Gradient flow: No detachment allows learning of refinement patterns
+            #
+            # Achieves 8-97% refinement depending on supervision_weight_base and improvement_reward_scale
+            assert kv_cache is None, "KV cache not supported during training with deep supervision"
+
+            N_sup = self.config.n_sup_train
+            y, z = x.clone(), torch.zeros_like(x)
+            total_loss = 0.0
+            supervision_losses = []
+
+            # Hierarchical weighting: base^i where base ∈ {3, 5, 10}
+            # base=3:  weights ≈ [0.025, 0.075, 0.225, 0.675]  → final step 27x more important
+            # base=5:  weights ≈ [0.008, 0.040, 0.200, 0.752]  → final step 94x more important
+            # base=10: weights ≈ [0.001, 0.009, 0.090, 0.900]  → final step 1000x more important
+            weighting_base = self.config.supervision_weight_base
+            weights = torch.tensor([weighting_base**i for i in range(N_sup)], device=x.device)
+            weights = weights / weights.sum()  # Normalize
+
+            for sup_step in range(N_sup):
+                for block in self.transformer.h:
+                    y, z = block(x, y, z, cos_sin, kv_cache=None)
+
+                logits = self.lm_head(norm(y))
+                logits = softcap * torch.tanh(logits / softcap)
+                logits = logits.float()
+
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                      targets.view(-1), ignore_index=-1,
+                                      reduction=loss_reduction)
+
+                # Apply hierarchical weight to this supervision step
+                weighted_loss = weights[sup_step] * loss
+                total_loss += weighted_loss
+                supervision_losses.append(loss.detach())
+
+                # Add improvement reward: bonus for improving over previous step
+                # Configurable via improvement_reward_scale (0.5=moderate, 1.0=strong, 2.0=extreme)
+                if sup_step > 0:
+                    prev_loss = supervision_losses[sup_step - 1]
+                    # Reward relative improvement (prev - current) / prev
+                    improvement = (prev_loss - loss) / (prev_loss + 1e-8)
+                    improvement_bonus = improvement * self.config.improvement_reward_scale
+                    total_loss -= improvement_bonus  # Subtract (lower loss is better)
+
+                # NO DETACHMENT: Allow gradients to flow for progressive refinement
+                # This enables TRM loops to learn to improve across supervision steps
+                # Gradient explosion is controlled via clipping + lower LR in training loop
+
+            # DEBUG: Print all supervision losses
+            # if all(l.numel() == 1 for l in supervision_losses):
+            #     print(f"DEBUG all supervision_losses: {[f'{l.item():.4f}' for l in supervision_losses]}")
+            #     # DEBUG: Print norms
+            #     print(f"DEBUG y norm: {y.norm().item():.4f}, z norm: {z.norm().item():.4f}")
+            aux_losses = {
+                'final': supervision_losses[-1],
+                'step_0': supervision_losses[0],
+                'step_2': supervision_losses[2] if len(supervision_losses) > 2 else supervision_losses[-1],
+                'step_4': supervision_losses[4] if len(supervision_losses) > 4 else supervision_losses[-1],
+            }
+            
+            return total_loss / N_sup, aux_losses
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

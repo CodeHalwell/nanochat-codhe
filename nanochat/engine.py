@@ -116,13 +116,13 @@ class KVCache:
                 # batch_size can be expanded
                 assert dim1 == dim2 or dim2 == 1, f"Batch dim mismatch: {dim1} != {dim2}"
             elif ix == 4:
-                # seq_len: self must be longer than other
-                assert dim1 >= dim2, f"Seq len mismatch: {dim1} < {dim2}"
+                # seq_len: self must be large enough to hold the data
+                assert dim1 >= other.pos, f"Seq len mismatch: {dim1} < {other.pos}"
         # 2) initialize the cache
         dtype, device = other.kv_cache.dtype, other.kv_cache.device
         self.kv_cache = torch.empty(self.kv_shape, dtype=dtype, device=device)
-        # 3) copy the data over
-        self.kv_cache[:, :, :, :, :other.pos, :] = other.kv_cache
+        # 3) copy the data over (only copy valid portion up to other.pos)
+        self.kv_cache[:, :, :, :, :other.pos, :] = other.kv_cache[:, :, :, :, :other.pos, :]
         # 4) update the pos
         self.pos = other.pos
 
@@ -191,7 +191,8 @@ class Engine:
         self.tokenizer = tokenizer # needed for tool use
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, 
+                 top_k=None, seed=42, bayesian_refine=False, refine_top_k=10):
         """Same as generate, but does single prefill and then clones the KV cache."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
@@ -209,20 +210,51 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        num_effective_layers = m.n_layer * (m.n_loops + 1)
+        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": num_effective_layers}
+        # Ensure prefill cache is at least as large as decode hint (if hint is larger than tokens)
+        # But actually, the decode cache MUST be larger or equal to prefill.
+        # The issue is that kv_cache_decode is init with `kv_length_hint`.
+        # kv_cache_prefill is init with `len(tokens)`.
+        # The assertion `dim1 >= dim2` (decode >= prefill) fails if decode < prefill.
+        # In the error: 22 < 2048. This means decode=22, prefill=2048.
+        # Why is prefill=2048? `len(tokens)` must be 2048.
+        
         kv_cache_prefill = KVCache(
             batch_size=1,
             seq_len=len(tokens),
             **kv_model_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-        logits = logits[:, -1, :]
+        
+        if bayesian_refine:
+            # Prior: quick pass (n_sup=1)
+            logits_prior = self.model.forward(ids, kv_cache=kv_cache_prefill, n_sup=1)
+            logits_prior = logits_prior[:, -1, :]
+            
+            # Refined: full pass (n_sup=4)
+            logits_ref = self.model.forward(ids, kv_cache=kv_cache_prefill, n_sup=4)
+            logits_ref = logits_ref[:, -1, :]
+            
+            # Mask refined logits to top-k of prior
+            if refine_top_k is not None:
+                top_k_prior = torch.topk(logits_prior, min(refine_top_k, logits_prior.size(-1))).indices
+                mask = torch.ones_like(logits_ref, dtype=torch.bool)
+                mask.scatter_(1, top_k_prior, False)
+                logits_ref[mask] = -float('Inf')
+            
+            logits = logits_ref
+        else:
+            logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+            logits = logits[:, -1, :]
+
         next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
         sampled_tokens = next_ids[:, 0].tolist()
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+        # Ensure hint is at least the prefill length
+        kv_length_hint = max(kv_length_hint, len(tokens))
         kv_cache_decode = KVCache(
             batch_size=num_samples,
             seq_len=kv_length_hint,
@@ -253,8 +285,24 @@ class Engine:
                 first_iteration = False
             else:
                 # Forward the model and get the next token for each row
-                logits = self.model.forward(ids, kv_cache=kv_cache_decode)  # (B, T, vocab_size)
-                logits = logits[:, -1, :]  # (B, vocab_size) at last time step
+                if bayesian_refine:
+                    logits_prior = self.model.forward(ids, kv_cache=kv_cache_decode, n_sup=1)
+                    logits_prior = logits_prior[:, -1, :]
+                    
+                    logits_ref = self.model.forward(ids, kv_cache=kv_cache_decode, n_sup=4)
+                    logits_ref = logits_ref[:, -1, :]
+                    
+                    if refine_top_k is not None:
+                        top_k_prior = torch.topk(logits_prior, min(refine_top_k, logits_prior.size(-1))).indices
+                        mask = torch.ones_like(logits_ref, dtype=torch.bool)
+                        mask.scatter_(1, top_k_prior, False)
+                        logits_ref[mask] = -float('Inf')
+                    
+                    logits = logits_ref
+                else:
+                    logits = self.model.forward(ids, kv_cache=kv_cache_decode)
+                    logits = logits[:, -1, :]
+                
                 next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
                 sampled_tokens = next_ids[:, 0].tolist()
 
