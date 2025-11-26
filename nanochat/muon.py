@@ -133,6 +133,11 @@ class DistMuon(torch.optim.Optimizer):
         if not all(p.grad is not None for group in self.param_groups for p in group["params"]):
            if rank == 0:
                print(f"Muon warning: some params are missing grads, treating them as zero")
+               # Debug: print which params are missing grads
+               for i, group in enumerate(self.param_groups):
+                   for j, p in enumerate(group["params"]):
+                       if p.grad is None:
+                           print(f"  Group {i}, Param {j}, Shape {p.shape} missing grad")
 
         # Kick off all the reduce scatter operations to average up the gradients across all ranks
         all_reduce_futures = []

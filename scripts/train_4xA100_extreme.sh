@@ -44,15 +44,15 @@ sleep 5
 
 uv run torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- \
     --depth=12 \
-    --n_loops=2 \
+    --n_loops=3 \
     --device_batch_size=14 \
     --gradient_accumulation_steps=4 \
     --num_iterations=5000 \
     --compile=True \
     --run=a100_4x_extreme_quality \
-    --matrix_lr=0.0005 \
-    --embedding_lr=0.005 \
-    --grad_clip=1.0 \
+    --matrix_lr=0.001 \
+    --embedding_lr=0.001 \
+    --grad_clip=0.5 \
     --save_every=500 \
     --eval_every=250 \
     --eval_tokens=1048576 \

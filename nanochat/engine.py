@@ -253,8 +253,9 @@ class Engine:
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        # Ensure hint is at least the prefill length
-        kv_length_hint = max(kv_length_hint, len(tokens))
+        # Ensure hint is at least the prefill cache position (accounts for recursive reasoning)
+        # With TRM recursion (n_loops, T_recursion), the cache position can be > len(tokens)
+        kv_length_hint = max(kv_length_hint, kv_cache_prefill.pos)
         kv_cache_decode = KVCache(
             batch_size=num_samples,
             seq_len=kv_length_hint,
@@ -405,7 +406,11 @@ if __name__ == "__main__":
     # generate tokens with Engine
     generated_tokens = []
     engine = Engine(model, tokenizer)
-    stream = engine.generate(prompt_tokens, num_samples=1, **kwargs) # note: runs in fp32
+    stream = engine.generate(
+        prompt_tokens,
+        bayesian=True,
+        num_samples=1,
+        **kwargs) # note: runs in fp32
     torch.cuda.synchronize()
     t0 = time.time()
     with autocast_ctx:
