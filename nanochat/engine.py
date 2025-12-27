@@ -408,7 +408,7 @@ if __name__ == "__main__":
     engine = Engine(model, tokenizer)
     stream = engine.generate(
         prompt_tokens,
-        bayesian=True,
+        bayesian_refine=True,
         num_samples=1,
         **kwargs) # note: runs in fp32
     torch.cuda.synchronize()
