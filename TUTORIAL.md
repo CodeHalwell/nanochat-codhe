@@ -891,7 +891,7 @@ loader = create_loader(resume_state=state)
 **How**: Average accuracy across tasks
 
 **Good Scores**:
-- CORE 0.22: Better than random (0.25 is random for 4-choice)
+- CORE 0.22: Slightly worse than random (0.25 is random for 4-choice)
 - CORE 0.35: GPT-2 level
 - CORE 0.50: Pretty good
 
