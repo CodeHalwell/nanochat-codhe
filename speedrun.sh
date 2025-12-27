@@ -91,6 +91,11 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- 
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
 # evaluate the model on CORE tasks
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
+# -----------------------------------------------------------------------------
+# Recursive Model Training (Optional)
+# To train a Recursive Model (e.g., 2 layers, 3 loops), use:
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=2 --n_loops=3 --run=$WANDB_RUN
+# -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
 # Midtraining (teach the model conversation special tokens, tool use, multiple choice)
@@ -112,6 +117,8 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"
+# Or with Bayesian Refinement (if using a Recursive Model):
+# python -m scripts.chat_cli -p "Why is the sky blue?" --bayesian-refine --refine-top-k 10
 
 # even better, chat with your model over a pretty WebUI ChatGPT style
 # python -m scripts.chat_web

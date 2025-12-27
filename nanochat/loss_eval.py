@@ -30,7 +30,11 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none') # (B, T)
+        outputs = model(x, y, loss_reduction='none') # (B, T) or ((B, T), aux)
+        if isinstance(outputs, tuple):
+            loss2d = outputs[0]
+        else:
+            loss2d = outputs
         loss2d = loss2d.view(-1) # flatten
         y = y.view(-1) # flatten
         if (y.int() < 0).any(): # mps does not currently have kernel for < 0 for int64, only int32

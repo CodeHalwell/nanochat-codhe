@@ -20,6 +20,8 @@ parser.add_argument('-t', '--temperature', type=float, default=0.6, help='Temper
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Top-k sampling parameter')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 parser.add_argument('-d', '--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16'])
+parser.add_argument('--bayesian-refine', action='store_true', help='Enable Bayesian Refinement Sampling')
+parser.add_argument('--refine-top-k', type=int, default=10, help='Top-K candidates for refinement')
 args = parser.parse_args()
 
 # Init the model and tokenizer
@@ -84,6 +86,8 @@ while True:
         "max_tokens": 256,
         "temperature": args.temperature,
         "top_k": args.top_k,
+        "bayesian_refine": args.bayesian_refine,
+        "refine_top_k": args.refine_top_k,
     }
     response_tokens = []
     print("\nAssistant: ", end="", flush=True)
